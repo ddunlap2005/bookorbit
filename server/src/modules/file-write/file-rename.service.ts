@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { access, mkdir, readdir, rename as fsRename, rmdir } from 'fs/promises';
+import { access, copyFile, mkdir, readdir, rename as fsRename, rm, rmdir, stat } from 'fs/promises';
 import { basename, dirname, extname, join, relative } from 'path';
 
 import type { FileRenameResult } from '@bookorbit/types';
@@ -294,14 +294,14 @@ export class FileRenameService implements OnModuleDestroy {
         const newPath = fileTargets.get(file.id)!;
         if (newPath !== file.absolutePath) {
           await mkdir(dirname(newPath), { recursive: true });
-          await this.lockService.withLock(file.absolutePath, () => fsRename(file.absolutePath, newPath));
+          await this.lockService.withLock(file.absolutePath, () => crossDeviceRename(file.absolutePath, newPath));
           moved.push({ from: file.absolutePath, to: newPath });
         }
       }
     } catch (error) {
       for (const { from, to } of [...moved].reverse()) {
         try {
-          await fsRename(to, from);
+          await crossDeviceRename(to, from);
         } catch (rollbackError) {
           this.logRollbackFailure(bookId, error, rollbackError);
         }
@@ -347,7 +347,7 @@ export class FileRenameService implements OnModuleDestroy {
       let folderRenamed = false;
       try {
         await mkdir(dirname(newFolderPath), { recursive: true });
-        await this.lockService.withLock(oldFolderPath, () => fsRename(oldFolderPath, newFolderPath));
+        await this.lockService.withLock(oldFolderPath, () => crossDeviceRename(oldFolderPath, newFolderPath));
         folderRenamed = true;
 
         const movedFilesInside: Array<{ from: string; to: string }> = [];
@@ -357,14 +357,14 @@ export class FileRenameService implements OnModuleDestroy {
             const intendedPath = fileTargets.get(file.id)!;
             if (currentPathAfterFolderRename !== intendedPath) {
               await mkdir(dirname(intendedPath), { recursive: true });
-              await this.lockService.withLock(currentPathAfterFolderRename, () => fsRename(currentPathAfterFolderRename, intendedPath));
+              await this.lockService.withLock(currentPathAfterFolderRename, () => crossDeviceRename(currentPathAfterFolderRename, intendedPath));
               movedFilesInside.push({ from: currentPathAfterFolderRename, to: intendedPath });
             }
           }
         } catch (innerError) {
           for (const { from, to } of [...movedFilesInside].reverse()) {
             try {
-              await fsRename(to, from);
+              await crossDeviceRename(to, from);
             } catch {
               /* ignore */
             }
@@ -406,7 +406,7 @@ export class FileRenameService implements OnModuleDestroy {
         }
 
         if (file.absolutePath !== newFilePath) {
-          await this.lockService.withLock(file.absolutePath, () => fsRename(file.absolutePath, newFilePath));
+          await this.lockService.withLock(file.absolutePath, () => crossDeviceRename(file.absolutePath, newFilePath));
           movedFiles.push({ from: file.absolutePath, to: newFilePath });
         }
       }
@@ -414,7 +414,7 @@ export class FileRenameService implements OnModuleDestroy {
       for (const { from, to } of [...movedFiles].reverse()) {
         try {
           await mkdir(dirname(from), { recursive: true });
-          await fsRename(to, from);
+          await crossDeviceRename(to, from);
         } catch (rollbackError) {
           this.logRollbackFailure(bookId, error, rollbackError);
         }
@@ -440,7 +440,7 @@ export class FileRenameService implements OnModuleDestroy {
 
   private async rollbackFolderMove(bookId: number, newFolderPath: string, oldFolderPath: string, originalError: unknown): Promise<void> {
     try {
-      await fsRename(newFolderPath, oldFolderPath);
+      await crossDeviceRename(newFolderPath, oldFolderPath);
     } catch (rollbackError) {
       this.logRollbackFailure(bookId, originalError, rollbackError);
     }
@@ -517,4 +517,36 @@ function resolvePositiveInteger(value: unknown, fallback: number): number {
   const numeric = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(numeric) || numeric < 1) return fallback;
   return Math.floor(numeric);
+}
+
+async function crossDeviceRename(oldPath: string, newPath: string): Promise<void> {
+  try {
+    await fsRename(oldPath, newPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
+      const stats = await stat(oldPath);
+      if (stats.isDirectory()) {
+        await copyDirRecursive(oldPath, newPath);
+      } else {
+        await copyFile(oldPath, newPath);
+      }
+      await rm(oldPath, { recursive: true, force: true });
+    } else {
+      throw err;
+    }
+  }
+}
+
+async function copyDirRecursive(src: string, dest: string): Promise<void> {
+  await mkdir(dest, { recursive: true });
+  const entries = await readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = join(src, entry.name);
+    const destPath = join(dest, entry.name);
+    if (entry.isDirectory()) {
+      await copyDirRecursive(srcPath, destPath);
+    } else {
+      await copyFile(srcPath, destPath);
+    }
+  }
 }

@@ -1,9 +1,14 @@
-import { rename, unlink } from 'fs/promises';
+import { copyFile, rename, unlink } from 'fs/promises';
 
 export async function replaceFileAtomically(tempPath: string, targetPath: string): Promise<void> {
   try {
     await rename(tempPath, targetPath);
   } catch (renameError) {
+    if (isErrnoCode(renameError, 'EXDEV')) {
+      await copyFile(tempPath, targetPath);
+      await unlink(tempPath).catch(() => {});
+      return;
+    }
     try {
       await unlink(tempPath);
     } catch (cleanupError) {
